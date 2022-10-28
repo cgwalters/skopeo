@@ -11,13 +11,28 @@ package main
   core containers/image library functionality.
 
   To use this command, in a parent process create a
-  `socketpair()` of type `SOCK_SEQPACKET`.  Fork
+  `socketpair()` of type `SOCK_SEQPACKET`.  (Or
+  `SOCK_STREAM` and provide `--stream`) Fork
   off this command, and pass one half of the socket
   pair to the child.  Providing it on stdin (fd 0)
   is the expected default.
 
   The protocol is JSON for the control layer,
   and  a read side of a `pipe()` passed for large data.
+
+  JSON messages are sent via `SOCK_SEQPACKET`; here the
+  kernel does the framing.  When using `SOCK_STREAM`,
+  instead there is a message header of the form:
+
+```
+struct MessageHeader {
+	length: uint32_t,
+	fds: uint32_t
+}
+```
+
+ The length describes the size of the JSON message, and the
+ fds member contains the provided number of file descriptors.
 
  Base JSON protocol:
 
@@ -62,6 +77,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -106,6 +122,11 @@ const maxJSONFloat = float64(uint64(1)<<53 - 1)
 
 // sentinelImageID represents "image not found" on the wire
 const sentinelImageID = 0
+
+type streamHeader struct {
+	jsonlen uint32
+	fds     uint32
+}
 
 // request is the JSON serialization of a function call
 type request struct {
@@ -643,7 +664,7 @@ func (h *proxyHandler) FinishPipe(args []interface{}) (replyBuf, error) {
 }
 
 // send writes a reply buffer to the socket
-func (buf replyBuf) send(conn *net.UnixConn, err error) error {
+func (buf replyBuf) send(conn *net.UnixConn, stream bool, err error) error {
 	replyToSerialize := reply{
 		Success: err == nil,
 		Value:   buf.value,
@@ -655,6 +676,20 @@ func (buf replyBuf) send(conn *net.UnixConn, err error) error {
 	serializedReply, err := json.Marshal(&replyToSerialize)
 	if err != nil {
 		return err
+	}
+	nfds := 0
+	if buf.fd != nil {
+		nfds = 1
+	}
+	if stream {
+		header := streamHeader{
+			jsonlen: uint32(len(serializedReply)),
+			fds:     uint32(nfds),
+		}
+		err = binary.Write(conn, binary.HostEndian, header)
+		if err != nil {
+			return err
+		}
 	}
 	// We took ownership of the FD - close it when we're done.
 	defer func() {
@@ -683,6 +718,8 @@ type proxyOptions struct {
 	global    *globalOptions
 	imageOpts *imageOptions
 	sockFd    int
+	// sockStream enables SOCK_STREAM versus SOCK_SEQPACKET
+	sockStream bool
 }
 
 func proxyCmd(global *globalOptions) *cobra.Command {
@@ -704,6 +741,7 @@ func proxyCmd(global *globalOptions) *cobra.Command {
 	flags.AddFlagSet(&sharedFlags)
 	flags.AddFlagSet(&imageFlags)
 	flags.IntVar(&opts.sockFd, "sockfd", 0, "Serve on opened socket pair (default 0/stdin)")
+	flags.BoolVar(&opts.sockStream, "stream", false, "Enable SOCK_STREAM instead of SOCK_SEQPACKET protocol")
 	return cmd
 }
 
@@ -764,25 +802,52 @@ func (opts *proxyOptions) run(args []string, stdout io.Writer) error {
 	}
 	conn := fconn.(*net.UnixConn)
 
-	// Allocate a buffer to copy the packet into
-	buf := make([]byte, maxMsgSize)
-	for {
-		n, _, err := conn.ReadFrom(buf)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
+	if opts.sockStream {
+		var hdr streamHeader
+		for {
+			err := binary.Read(conn, binary.HostEndian, &hdr)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+				return fmt.Errorf("reading socket: %v", err)
+			}
+			buf := make([]byte, hdr.jsonlen)
+			n, err := conn.Read(buf)
+			if n != int(hdr.jsonlen) {
+				return fmt.Errorf("Unexpected end of stream, expecting %d bytes, got %d", hdr.jsonlen, n)
+			}
+
+			rb, terminate, err := handler.processRequest(buf)
+			if terminate {
 				return nil
 			}
-			return fmt.Errorf("reading socket: %v", err)
-		}
-		readbuf := buf[0:n]
 
-		rb, terminate, err := handler.processRequest(readbuf)
-		if terminate {
-			return nil
+			if err := rb.send(conn, true, err); err != nil {
+				return fmt.Errorf("writing to socket: %w", err)
+			}
 		}
+	} else {
+		// Allocate a buffer to copy the packet into
+		buf := make([]byte, maxMsgSize)
+		for {
+			n, _, err := conn.ReadFrom(buf)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+				return fmt.Errorf("reading socket: %v", err)
+			}
+			readbuf := buf[0:n]
 
-		if err := rb.send(conn, err); err != nil {
-			return fmt.Errorf("writing to socket: %w", err)
+			rb, terminate, err := handler.processRequest(readbuf)
+			if terminate {
+				return nil
+			}
+
+			if err := rb.send(conn, false, err); err != nil {
+				return fmt.Errorf("writing to socket: %w", err)
+			}
 		}
 	}
 }
