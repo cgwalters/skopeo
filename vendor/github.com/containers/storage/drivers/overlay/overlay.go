@@ -25,9 +25,11 @@ import (
 	"github.com/containers/storage/pkg/chrootarchive"
 	"github.com/containers/storage/pkg/directory"
 	"github.com/containers/storage/pkg/fsutils"
+	"github.com/containers/storage/pkg/idmap"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/mount"
 	"github.com/containers/storage/pkg/parsers"
+	"github.com/containers/storage/pkg/stringid"
 	"github.com/containers/storage/pkg/system"
 	"github.com/containers/storage/pkg/unshare"
 	units "github.com/docker/go-units"
@@ -45,8 +47,7 @@ var (
 )
 
 const (
-	defaultPerms     = os.FileMode(0555)
-	selinuxLabelTest = "system_u:object_r:container_file_t:s0"
+	defaultPerms = os.FileMode(0555)
 )
 
 // This backend uses the overlay union filesystem for containers
@@ -73,21 +74,23 @@ const (
 // or root directory. Mounts are always done relative to root and
 // referencing the symbolic links in order to ensure the number of
 // lower directories can fit in a single page for making the mount
-// syscall. A hard upper limit of 128 lower layers is enforced to ensure
+// syscall. A hard upper limit of 500 lower layers is enforced to ensure
 // that mounts do not fail due to length.
 
 const (
 	linkDir   = "l"
 	lowerFile = "lower"
-	maxDepth  = 128
+	maxDepth  = 500
 
 	// idLength represents the number of random characters
 	// which can be used to create the unique link identifier
 	// for every layer. If this value is too long then the
 	// page size limit for the mount command may be exceeded.
 	// The idLength should be selected such that following equation
-	// is true (512 is a buffer for label metadata).
-	// ((idLength + len(linkDir) + 1) * maxDepth) <= (pageSize - 512)
+	// is true (512 is a buffer for label metadata, 128 is the
+	// number of lowers we want to be able to use without having
+	// to use bind mounts to get all the way to the kernel limit).
+	// ((idLength + len(linkDir) + 1) * 128) <= (pageSize - 512)
 	idLength = 26
 )
 
@@ -140,8 +143,8 @@ var (
 )
 
 func init() {
-	graphdriver.Register("overlay", Init)
-	graphdriver.Register("overlay2", Init)
+	graphdriver.MustRegister("overlay", Init)
+	graphdriver.MustRegister("overlay2", Init)
 }
 
 func hasMetacopyOption(opts []string) bool {
@@ -309,9 +312,11 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 	if err != nil {
 		return nil, err
 	}
-	if fsName, ok := graphdriver.FsNames[fsMagic]; ok {
-		backingFs = fsName
+	fsName, ok := graphdriver.FsNames[fsMagic]
+	if !ok {
+		fsName = "<unknown>"
 	}
+	backingFs = fsName
 
 	runhome := filepath.Join(options.RunRoot, filepath.Base(home))
 	rootUID, rootGID, err := idtools.GetRootUIDGID(options.UIDMaps, options.GIDMaps)
@@ -352,9 +357,9 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 		if opts.forceMask != nil {
 			return nil, errors.New("'force_mask' is supported only with 'mount_program'")
 		}
-		// check if they are running over btrfs, aufs, zfs, overlay, or ecryptfs
+		// check if they are running over btrfs, aufs, overlay, or ecryptfs
 		switch fsMagic {
-		case graphdriver.FsMagicAufs, graphdriver.FsMagicZfs, graphdriver.FsMagicOverlay, graphdriver.FsMagicEcryptfs:
+		case graphdriver.FsMagicAufs, graphdriver.FsMagicOverlay, graphdriver.FsMagicEcryptfs:
 			return nil, fmt.Errorf("'overlay' is not supported over %s, a mount_program is required: %w", backingFs, graphdriver.ErrIncompatibleFS)
 		}
 		if unshare.IsRootless() && isNetworkFileSystem(fsMagic) {
@@ -541,6 +546,9 @@ func parseOptions(options []string) (*overlayOptions, error) {
 		case "skip_mount_home":
 			logrus.Debugf("overlay: skip_mount_home=%s", val)
 			o.skipMountHome, err = strconv.ParseBool(val)
+			if err != nil {
+				return nil, err
+			}
 		case "ignore_chown_errors":
 			logrus.Debugf("overlay: ignore_chown_errors=%s", val)
 			o.ignoreChownErrors, err = strconv.ParseBool(val)
@@ -648,6 +656,8 @@ func SupportsNativeOverlay(home, runhome string) (bool, error) {
 func supportsOverlay(home string, homeMagic graphdriver.FsMagic, rootUID, rootGID int) (supportsDType bool, err error) {
 	// We can try to modprobe overlay first
 
+	selinuxLabelTest := selinux.PrivContainerMountLabel()
+
 	exec.Command("modprobe", "overlay").Run()
 
 	logLevel := logrus.ErrorLevel
@@ -675,8 +685,11 @@ func supportsOverlay(home string, homeMagic graphdriver.FsMagic, rootUID, rootGI
 
 		// Try a test mount in the specific location we're looking at using.
 		mergedDir := filepath.Join(layerDir, "merged")
+		mergedSubdir := filepath.Join(mergedDir, "subdir")
 		lower1Dir := filepath.Join(layerDir, "lower1")
 		lower2Dir := filepath.Join(layerDir, "lower2")
+		lower2Subdir := filepath.Join(lower2Dir, "subdir")
+		lower2SubdirFile := filepath.Join(lower2Subdir, "file")
 		upperDir := filepath.Join(layerDir, "upper")
 		workDir := filepath.Join(layerDir, "work")
 		defer func() {
@@ -690,8 +703,15 @@ func supportsOverlay(home string, homeMagic graphdriver.FsMagic, rootUID, rootGI
 		_ = idtools.MkdirAs(mergedDir, 0700, rootUID, rootGID)
 		_ = idtools.MkdirAs(lower1Dir, 0700, rootUID, rootGID)
 		_ = idtools.MkdirAs(lower2Dir, 0700, rootUID, rootGID)
+		_ = idtools.MkdirAs(lower2Subdir, 0700, rootUID, rootGID)
 		_ = idtools.MkdirAs(upperDir, 0700, rootUID, rootGID)
 		_ = idtools.MkdirAs(workDir, 0700, rootUID, rootGID)
+		f, err := os.Create(lower2SubdirFile)
+		if err != nil {
+			logrus.Debugf("Unable to create test file: %v", err)
+			return supportsDType, fmt.Errorf("unable to create test file: %w", err)
+		}
+		f.Close()
 		flags := fmt.Sprintf("lowerdir=%s:%s,upperdir=%s,workdir=%s", lower1Dir, lower2Dir, upperDir, workDir)
 		if selinux.GetEnabled() &&
 			selinux.SecurityCheckContext(selinuxLabelTest) == nil {
@@ -711,6 +731,10 @@ func supportsOverlay(home string, homeMagic graphdriver.FsMagic, rootUID, rootGI
 		if len(flags) < unix.Getpagesize() {
 			err := unix.Mount("overlay", mergedDir, "overlay", 0, flags)
 			if err == nil {
+				if err = os.RemoveAll(mergedSubdir); err != nil {
+					logrus.StandardLogger().Logf(logLevel, "overlay: removing an item from the merged directory failed: %v", err)
+					return supportsDType, fmt.Errorf("kernel returned %v when we tried to delete an item in the merged directory: %w", err, graphdriver.ErrNotSupported)
+				}
 				logrus.Debugf("overlay: test mount with multiple lowers succeeded")
 				return supportsDType, nil
 			}
@@ -1197,6 +1221,9 @@ func (d *Driver) Remove(id string) error {
 	if err := system.EnsureRemoveAll(dir); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	if d.quotaCtl != nil {
+		d.quotaCtl.ClearQuota(dir)
+	}
 	return nil
 }
 
@@ -1374,27 +1401,9 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 		return "", errors.New("max depth exceeded")
 	}
 
-	// absLowers is the list of lowers as absolute paths, which works well with additional stores.
+	// absLowers is the list of lowers as absolute paths.
 	absLowers := []string{}
-	// relLowers is the list of lowers as paths relative to the driver's home directory.
-	relLowers := []string{}
 
-	// Check if $link/../diff{1-*} exist.  If they do, add them, in order, as the front of the lowers
-	// lists that we're building.  "diff" itself is the upper, so it won't be in the lists.
-	link, err := os.ReadFile(path.Join(dir, "link"))
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return "", err
-		}
-		logrus.Warnf("Can't read parent link %q because it does not exist. Going through storage to recreate the missing links.", path.Join(dir, "link"))
-		if err := d.recreateSymlinks(); err != nil {
-			return "", fmt.Errorf("recreating the links: %w", err)
-		}
-		link, err = os.ReadFile(path.Join(dir, "link"))
-		if err != nil {
-			return "", err
-		}
-	}
 	diffN := 1
 	perms := defaultPerms
 	if d.options.forceMask != nil {
@@ -1408,7 +1417,6 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 	}
 	for err == nil {
 		absLowers = append(absLowers, filepath.Join(dir, nameWithSuffix("diff", diffN)))
-		relLowers = append(relLowers, dumbJoin(linkDir, string(link), "..", nameWithSuffix("diff", diffN)))
 		diffN++
 		st, err = os.Stat(filepath.Join(dir, nameWithSuffix("diff", diffN)))
 		if err == nil && !permsKnown {
@@ -1457,12 +1465,10 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 			lower = newpath
 		}
 		absLowers = append(absLowers, lower)
-		relLowers = append(relLowers, l)
 		diffN = 1
 		_, err = os.Stat(dumbJoin(lower, "..", nameWithSuffix("diff", diffN)))
 		for err == nil {
 			absLowers = append(absLowers, dumbJoin(lower, "..", nameWithSuffix("diff", diffN)))
-			relLowers = append(relLowers, dumbJoin(l, "..", nameWithSuffix("diff", diffN)))
 			diffN++
 			_, err = os.Stat(dumbJoin(lower, "..", nameWithSuffix("diff", diffN)))
 		}
@@ -1470,7 +1476,6 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 
 	if len(absLowers) == 0 {
 		absLowers = append(absLowers, path.Join(dir, "empty"))
-		relLowers = append(relLowers, path.Join(id, "empty"))
 	}
 	// user namespace requires this to move a directory from lower to upper.
 	rootUID, rootGID, err := idtools.GetRootUIDGID(d.uidMaps, d.gidMaps)
@@ -1517,14 +1522,14 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 		}
 	}
 
-	if d.supportsIDmappedMounts() && len(options.UidMaps) > 0 && len(options.GidMaps) > 0 {
+	if !disableShifting && len(options.UidMaps) > 0 && len(options.GidMaps) > 0 && d.options.mountProgram == "" {
 		var newAbsDir []string
 		mappedRoot := filepath.Join(d.home, id, "mapped")
 		if err := os.MkdirAll(mappedRoot, 0700); err != nil {
 			return "", err
 		}
 
-		pid, cleanupFunc, err := createUsernsProcess(options.UidMaps, options.GidMaps)
+		pid, cleanupFunc, err := idmap.CreateUsernsProcess(options.UidMaps, options.GidMaps)
 		if err != nil {
 			return "", err
 		}
@@ -1541,7 +1546,7 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 			if !found {
 				root = filepath.Join(mappedRoot, fmt.Sprintf("%d", c))
 				c++
-				if err := createIDMappedMount(mappedMountSrc, root, int(pid)); err != nil {
+				if err := idmap.CreateIDMappedMount(mappedMountSrc, root, int(pid)); err != nil {
 					return "", fmt.Errorf("create mapped mount for %q on %q: %w", mappedMountSrc, root, err)
 				}
 				idMappedMounts[mappedMountSrc] = root
@@ -1604,28 +1609,23 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 			return nil
 		}
 	} else if len(mountData) >= pageSize {
-		// Use relative paths and mountFrom when the mount data has exceeded
-		// the page size. The mount syscall fails if the mount data cannot
-		// fit within a page and relative links make the mount data much
-		// smaller at the expense of requiring a fork exec to chroot.
+		// Use mountFrom when the mount data has exceeded the page size. The mount syscall fails if
+		// the mount data cannot fit within a page and relative links make the mount data much
+		// smaller at the expense of requiring a fork exec to chdir().
 
 		workdir = path.Join(id, "work")
-		//FIXME: We need to figure out to get this to work with additional stores
 		if readWrite {
 			diffDir := path.Join(id, "diff")
-			opts = fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(relLowers, ":"), diffDir, workdir)
+			opts = fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(absLowers, ":"), diffDir, workdir)
 		} else {
-			opts = fmt.Sprintf("lowerdir=%s:%s", diffDir, strings.Join(relLowers, ":"))
+			opts = fmt.Sprintf("lowerdir=%s:%s", diffDir, strings.Join(absLowers, ":"))
 		}
 		if len(optsList) > 0 {
 			opts = fmt.Sprintf("%s,%s", opts, strings.Join(optsList, ","))
 		}
 		mountData = label.FormatMountLabel(opts, options.MountLabel)
-		if len(mountData) >= pageSize {
-			return "", fmt.Errorf("cannot mount layer, mount label %q too large %d >= page size %d", options.MountLabel, len(mountData), pageSize)
-		}
 		mountFunc = func(source string, target string, mType string, flags uintptr, label string) error {
-			return mountFrom(d.home, source, target, mType, flags, label)
+			return mountOverlayFrom(d.home, source, target, mType, flags, label)
 		}
 		mountTarget = path.Join(id, "merged")
 	}
@@ -1719,6 +1719,28 @@ func (d *Driver) Exists(id string) bool {
 	return err == nil
 }
 
+// List layers (not including additional image stores)
+func (d *Driver) ListLayers() ([]string, error) {
+	entries, err := os.ReadDir(d.home)
+	if err != nil {
+		return nil, err
+	}
+
+	layers := make([]string, 0)
+
+	for _, entry := range entries {
+		id := entry.Name()
+		// Does it look like a datadir directory?
+		if !entry.IsDir() || stringid.ValidateID(id) != nil {
+			continue
+		}
+
+		layers = append(layers, id)
+	}
+
+	return layers, err
+}
+
 // isParent returns if the passed in parent is the direct parent of the passed in layer
 func (d *Driver) isParent(id, parent string) bool {
 	lowers, err := d.getLowerDirs(id)
@@ -1806,7 +1828,7 @@ func (d *Driver) ApplyDiffWithDiffer(id, parent string, options *graphdriver.App
 		idMappings = &idtools.IDMappings{}
 	}
 
-	applyDir := ""
+	var applyDir string
 
 	if id == "" {
 		err := os.MkdirAll(d.getStagingDir(), 0700)
@@ -2081,8 +2103,8 @@ func (d *Driver) supportsIDmappedMounts() bool {
 
 // SupportsShifting tells whether the driver support shifting of the UIDs/GIDs in an userNS
 func (d *Driver) SupportsShifting() bool {
-	if os.Getenv("_TEST_FORCE_SUPPORT_SHIFTING") == "yes-please" {
-		return true
+	if os.Getenv("_CONTAINERS_OVERLAY_DISABLE_IDMAP") == "yes" {
+		return false
 	}
 	if d.options.mountProgram != "" {
 		return true
