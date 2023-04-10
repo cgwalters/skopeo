@@ -12,8 +12,8 @@ import (
 
 	"github.com/containers/image/v5/internal/imagesource/impl"
 	"github.com/containers/image/v5/internal/imagesource/stubs"
+	"github.com/containers/image/v5/internal/manifest"
 	"github.com/containers/image/v5/internal/private"
-	"github.com/containers/image/v5/manifest"
 	"github.com/containers/image/v5/pkg/tlsclientconfig"
 	"github.com/containers/image/v5/types"
 	"github.com/docker/go-connections/tlsconfig"
@@ -94,6 +94,7 @@ func (s *ociImageSource) Reference() types.ImageReference {
 
 // Close removes resources associated with an initialized ImageSource, if any.
 func (s *ociImageSource) Close() error {
+	s.client.CloseIdleConnections()
 	return nil
 }
 
@@ -107,7 +108,7 @@ func (s *ociImageSource) GetManifest(ctx context.Context, instanceDigest *digest
 	var err error
 
 	if instanceDigest == nil {
-		dig = digest.Digest(s.descriptor.Digest)
+		dig = s.descriptor.Digest
 		mimeType = s.descriptor.MediaType
 	} else {
 		dig = *instanceDigest
