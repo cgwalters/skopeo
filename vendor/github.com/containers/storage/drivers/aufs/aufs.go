@@ -67,7 +67,7 @@ var (
 const defaultPerms = os.FileMode(0555)
 
 func init() {
-	graphdriver.Register("aufs", Init)
+	graphdriver.MustRegister("aufs", Init)
 }
 
 // Driver contains information about the filesystem mounted.
@@ -239,7 +239,7 @@ func (a *Driver) Status() [][2]string {
 
 // Metadata not implemented
 func (a *Driver) Metadata(id string) (map[string]string, error) {
-	return nil, nil
+	return nil, nil //nolint: nilnil
 }
 
 // Exists returns true if the given id is registered with
@@ -249,6 +249,11 @@ func (a *Driver) Exists(id string) bool {
 		return false
 	}
 	return true
+}
+
+// List layers (not including additional image stores)
+func (a *Driver) ListLayers() ([]string, error) {
+	return nil, graphdriver.ErrNotSupported
 }
 
 // AdditionalImageStores returns additional image stores supported by the driver
