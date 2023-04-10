@@ -19,6 +19,23 @@ import (
 	terminal "golang.org/x/term"
 )
 
+// ErrNewCredentialsInvalid means that the new user-provided credentials are
+// not accepted by the registry.
+type ErrNewCredentialsInvalid struct {
+	underlyingError error
+	message         string
+}
+
+// Error returns the error message as a string.
+func (e ErrNewCredentialsInvalid) Error() string {
+	return e.message
+}
+
+// Unwrap returns the underlying error.
+func (e ErrNewCredentialsInvalid) Unwrap() error {
+	return e.underlyingError
+}
+
 // GetDefaultAuthFile returns env value REGISTRY_AUTH_FILE as default
 // --authfile path used in multiple --authfile flag definitions
 // Will fail over to DOCKER_CONFIG if REGISTRY_AUTH_FILE environment is not set
@@ -77,7 +94,7 @@ func Login(ctx context.Context, systemContext *types.SystemContext, opts *LoginO
 	switch len(args) {
 	case 0:
 		if !opts.AcceptUnspecifiedRegistry {
-			return errors.New("please provide a registry to login to")
+			return errors.New("please provide a registry to log in to")
 		}
 		if key, err = defaultRegistryWhenUnspecified(systemContext); err != nil {
 			return err
@@ -92,7 +109,7 @@ func Login(ctx context.Context, systemContext *types.SystemContext, opts *LoginO
 		}
 
 	default:
-		return errors.New("login accepts only one registry to login to")
+		return errors.New("login accepts only one registry to log in to")
 	}
 
 	authConfig, err := config.GetCredentials(systemContext, key)
@@ -143,22 +160,25 @@ func Login(ctx context.Context, systemContext *types.SystemContext, opts *LoginO
 	}
 
 	if err = docker.CheckAuth(ctx, systemContext, username, password, registry); err == nil {
-		// Write the new credentials to the authfile
-		desc, err := config.SetCredentials(systemContext, key, username, password)
-		if err != nil {
-			return err
+		if !opts.NoWriteBack {
+			// Write the new credentials to the authfile
+			desc, err := config.SetCredentials(systemContext, key, username, password)
+			if err != nil {
+				return err
+			}
+			if opts.Verbose {
+				fmt.Fprintln(opts.Stdout, "Used: ", desc)
+			}
 		}
-		if opts.Verbose {
-			fmt.Fprintln(opts.Stdout, "Used: ", desc)
-		}
-	}
-	if err == nil {
 		fmt.Fprintln(opts.Stdout, "Login Succeeded!")
 		return nil
 	}
 	if unauthorized, ok := err.(docker.ErrUnauthorizedForCredentials); ok {
 		logrus.Debugf("error logging into %q: %v", key, unauthorized)
-		return fmt.Errorf("logging into %q: invalid username/password", key)
+		return ErrNewCredentialsInvalid{
+			underlyingError: err,
+			message:         fmt.Sprintf("logging into %q: invalid username/password", key),
+		}
 	}
 	return fmt.Errorf("authenticating creds for %q: %w", key, err)
 }
@@ -279,7 +299,7 @@ func Logout(systemContext *types.SystemContext, opts *LogoutOptions, args []stri
 	switch len(args) {
 	case 0:
 		if !opts.AcceptUnspecifiedRegistry {
-			return errors.New("please provide a registry to logout from")
+			return errors.New("please provide a registry to log out from")
 		}
 		if key, err = defaultRegistryWhenUnspecified(systemContext); err != nil {
 			return err
@@ -294,7 +314,7 @@ func Logout(systemContext *types.SystemContext, opts *LogoutOptions, args []stri
 		}
 
 	default:
-		return errors.New("logout accepts only one registry to logout from")
+		return errors.New("logout accepts only one registry to log out from")
 	}
 
 	err = config.RemoveAuthentication(systemContext, key)
